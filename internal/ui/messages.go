@@ -33,6 +33,9 @@ type transcriptMsg struct {
 
 type tickMsg time.Time
 type fadeTickMsg time.Time
+type expandTickMsg time.Time
+type transcriptTickMsg struct{ id string }
+type replyAnimTickMsg struct{ id string }
 
 // toastMsg shows a short status string at the bottom of the screen for ~3s.
 type toastMsg struct{ text string }
@@ -42,8 +45,3 @@ type toastClearMsg struct{}
 type chordTimeoutMsg struct{ generation int }
 
 type attachExitedMsg struct{ err error }
-type spawnedMsg struct {
-	cwd    string
-	target string
-	err    error
-}

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/adrian/whip/internal/tmuxctl"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -29,7 +31,6 @@ const (
 	modalFilter
 	modalCmd
 	modalFollowup
-	modalSpawn
 	modalHelp
 )
 
@@ -48,8 +49,19 @@ type Model struct {
 	selected string // sessionId; survives reorders better than index
 	scroll   int    // index of first visible row, for j/k scrolling
 
-	previews     map[string]string    // sessionId -> short last-line summary
-	previewKey   map[string]time.Time // last UpdatedAt the preview was sourced from
+	previews     map[string]string                  // sessionId -> short last-line summary
+	previewKey   map[string]time.Time               // last UpdatedAt the preview was sourced from
+	replies      map[string][]string                // sessionId -> last few assistant text replies (oldest→newest)
+
+	expanded    bool      // whether the selected row is expanded
+	expandStart time.Time // wall clock at which the reveal animation began
+
+	// replyReveal tracks per-session typewriter animation state for the
+	// most recent assistant reply. We snapshot the previous tail and let
+	// the visible char count walk forward over time.
+	replyReveal map[string]*replyRevealState
+
+	followupTarget string // tmux target captured when the followup modal opened
 
 	filter   string
 	matches  []int // indices into m.sessions for n/N
@@ -59,6 +71,7 @@ type Model struct {
 
 	modal      modalKind
 	input      textinput.Model
+	textarea   textarea.Model
 	pendingG   bool
 	chordGen   int
 	firstSeen  map[string]time.Time
@@ -76,6 +89,12 @@ func NewModel(src source.Source, notifier *notify.Notifier, remote bool, host st
 	ti.Prompt = "› "
 	ti.CharLimit = 0
 
+	ta := textarea.New()
+	ta.Prompt = "│ "
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 0
+	ta.SetHeight(4)
+
 	return Model{
 		src:        src,
 		notifier:   notifier,
@@ -84,9 +103,12 @@ func NewModel(src source.Source, notifier *notify.Notifier, remote bool, host st
 		keys:       DefaultKeyMap(),
 		spinner:    sp,
 		input:      ti,
-		previews:   map[string]string{},
-		previewKey: map[string]time.Time{},
-		firstSeen:  map[string]time.Time{},
+		textarea:   ta,
+		previews:    map[string]string{},
+		previewKey:  map[string]time.Time{},
+		replies:     map[string][]string{},
+		replyReveal: map[string]*replyRevealState{},
+		firstSeen:   map[string]time.Time{},
 	}
 }
 
@@ -120,6 +142,39 @@ func loadTranscript(src source.Source, id string) tea.Cmd {
 
 func fadeTick() tea.Cmd {
 	return tea.Tick(80*time.Millisecond, func(t time.Time) tea.Msg { return fadeTickMsg(t) })
+}
+
+const expandAnimDuration = 220 * time.Millisecond
+
+func expandTick() tea.Cmd {
+	return tea.Tick(20*time.Millisecond, func(t time.Time) tea.Msg { return expandTickMsg(t) })
+}
+
+const transcriptPollInterval = 750 * time.Millisecond
+
+func transcriptTick(id string) tea.Cmd {
+	return tea.Tick(transcriptPollInterval, func(time.Time) tea.Msg {
+		return transcriptTickMsg{id: id}
+	})
+}
+
+// replyRevealState animates a typewriter effect on the latest assistant
+// reply. `target` is the full text we're animating toward; `visible` is how
+// many runes of it are currently shown. While visible < len(target runes),
+// we keep ticking and incrementing visible.
+type replyRevealState struct {
+	target  []rune
+	visible int
+	prefix  int // runes that were already on screen before this round
+}
+
+const replyAnimInterval = 30 * time.Millisecond
+const replyCharsPerTick = 6
+
+func replyAnimTick(id string) tea.Cmd {
+	return tea.Tick(replyAnimInterval, func(time.Time) tea.Msg {
+		return replyAnimTickMsg{id: id}
+	})
 }
 
 func chordTimeout(gen int) tea.Cmd {
@@ -188,8 +243,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if p := claude.Preview(msg.events); p != "" {
 				m.previews[msg.id] = p
 			}
+			newReplies := lastAssistantReplies(msg.events, expandedReplyCount)
+			cmd := m.updateReplyReveal(msg.id, newReplies)
+			m.replies[msg.id] = newReplies
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 			if s := m.findSession(msg.id); s != nil {
 				m.previewKey[msg.id] = s.UpdatedAt
+			}
+		}
+
+	case replyAnimTickMsg:
+		st, ok := m.replyReveal[msg.id]
+		if ok && st.visible < len(st.target) {
+			st.visible += replyCharsPerTick
+			if st.visible > len(st.target) {
+				st.visible = len(st.target)
+			}
+			if st.visible < len(st.target) {
+				cmds = append(cmds, replyAnimTick(msg.id))
 			}
 		}
 
@@ -202,6 +275,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Periodic redraw so newly-added rows finish their fade-in. We just
 		// rely on a future fadeTick — the View() reads firstSeen each frame.
 		cmds = append(cmds, fadeTick())
+
+	case expandTickMsg:
+		// Drive frames of the expansion reveal until it's fully open.
+		if m.expanded && time.Since(m.expandStart) < expandAnimDuration {
+			cmds = append(cmds, expandTick())
+		}
+
+	case transcriptTickMsg:
+		// Live transcript poll: while the expansion is open on a session,
+		// re-read its transcript every transcriptPollInterval. The session
+		// file's updatedAt only changes on status flips, so we can't rely
+		// on Source.Watch for streaming token output.
+		if m.expanded && msg.id == m.selected {
+			cmds = append(cmds, loadTranscript(m.src, msg.id), m.transcriptPoll())
+		}
 
 	case chordTimeoutMsg:
 		if msg.generation == m.chordGen {
@@ -224,15 +312,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.selected != "" {
 			cmds = append(cmds, loadTranscript(m.src, m.selected))
-		}
-
-	case spawnedMsg:
-		if msg.err != nil {
-			m = m.setToast("spawn: " + msg.err.Error())
-			cmds = append(cmds, toastClearCmd(4*time.Second))
-		} else {
-			m = m.setToast("spawned in tmux: " + msg.target)
-			cmds = append(cmds, toastClearCmd(3*time.Second))
 		}
 
 	case tea.KeyMsg:
@@ -278,29 +357,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if s == nil {
 			return m, nil
 		}
-		if s.Origin != claude.OriginWhip || s.TmuxTarget == "" {
-			return m.setToast("not whip-managed; press o to attach"),
+		target := m.findContainingPane(s.PID)
+		if target == "" {
+			return m.setToast("not in tmux; press o to attach"),
 				toastClearCmd(3 * time.Second)
 		}
+		m.followupTarget = target
 		m.modal = modalFollowup
-		m.input.SetValue("")
-		m.input.Prompt = "send › "
-		m.input.Focus()
-		return m, textinput.Blink
+		w := m.followupWidth()
+		m.textarea.SetWidth(w)
+		m.textarea.SetValue("")
+		m.textarea.Focus()
+		return m, textarea.Blink
 	}
-	if key.Matches(msg, m.keys.Spawn) {
-		m.modal = modalSpawn
-		m.input.SetValue("")
-		m.input.Prompt = "cwd › "
-		m.input.Focus()
-		return m, textinput.Blink
+	if key.Matches(msg, m.keys.Expand) {
+		if m.expanded {
+			m.expanded = false
+			return m, nil
+		}
+		m.expanded = true
+		m.expandStart = time.Now()
+		return m, tea.Batch(expandTick(), m.forceLoadPreview(), m.transcriptPoll())
 	}
 	if key.Matches(msg, m.keys.Attach) {
 		s := m.findSession(m.selected)
 		if s == nil {
 			return m, nil
 		}
-		return m, m.attachCmd(s.ID)
+		return m, m.attachCmd(*s)
 	}
 	if key.Matches(msg, m.keys.Refresh) {
 		return m, loadInitial(m.src)
@@ -324,34 +408,66 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Down):
 		m.move(1)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.Up):
 		m.move(-1)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.PageDown):
 		m.move(10)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.PageUp):
 		m.move(-10)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.Bottom):
 		m.moveBottom()
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.NextMatch):
 		m.cycleMatch(1)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	case key.Matches(msg, m.keys.PrevMatch):
 		m.cycleMatch(-1)
-		return m, m.maybeLoadPreview()
+		return m, m.afterMoveCmd()
 	}
 
 	return m, nil
+}
+
+// afterMoveCmd handles the side effects of changing the selected row: kick
+// off a transcript reload, and if the expansion is open, restart its reveal
+// animation so it lands on the new row instead of jumping fully drawn.
+func (m *Model) afterMoveCmd() tea.Cmd {
+	cmds := []tea.Cmd{m.maybeLoadPreview()}
+	if m.expanded {
+		m.expandStart = time.Now()
+		cmds = append(cmds, expandTick(), m.transcriptPoll())
+	}
+	return tea.Batch(cmds...)
+}
+
+// forceLoadPreview triggers a transcript fetch regardless of cache state.
+// Used when the user opens the expansion so we always show fresh content.
+func (m Model) forceLoadPreview() tea.Cmd {
+	if m.selected == "" {
+		return nil
+	}
+	return loadTranscript(m.src, m.selected)
+}
+
+// transcriptPoll schedules the next transcript re-read for the selected
+// session. The handler decides whether to actually issue the read (only if
+// the expansion is still open on the same row).
+func (m Model) transcriptPoll() tea.Cmd {
+	if m.selected == "" {
+		return nil
+	}
+	return transcriptTick(m.selected)
 }
 
 func (m Model) handleModalKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if msg.Type == tea.KeyEsc {
 		m.modal = modalNone
 		m.input.Blur()
+		m.textarea.Blur()
 		return m, nil
 	}
 
@@ -389,18 +505,21 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, cmd
 
 	case modalFollowup:
-		if msg.Type == tea.KeyEnter {
-			text := m.input.Value()
-			s := m.findSession(m.selected)
+		// Ctrl+Enter (or Ctrl+J / Ctrl+D) sends; plain Enter inserts a newline.
+		if msg.Type == tea.KeyCtrlD ||
+			(msg.Type == tea.KeyEnter && msg.Alt) ||
+			msg.String() == "ctrl+j" {
+			text := m.textarea.Value()
+			target := m.followupTarget
 			m.modal = modalNone
-			m.input.Blur()
-			if s == nil || s.TmuxTarget == "" {
+			m.textarea.Blur()
+			if target == "" || strings.TrimSpace(text) == "" {
 				return m, nil
 			}
-			target := s.TmuxTarget
+			remote, host := m.remote, m.host
 			return m, func() tea.Msg {
-				if m.remote {
-					if err := remoteSendKeys(m.host, target, text); err != nil {
+				if remote {
+					if err := remoteSendKeys(host, target, text); err != nil {
 						return toastMsg{text: "send-keys: " + err.Error()}
 					}
 				} else {
@@ -412,26 +531,9 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
+		m.textarea, cmd = m.textarea.Update(msg)
 		return m, cmd
 
-	case modalSpawn:
-		if msg.Type == tea.KeyEnter {
-			cwd := strings.TrimSpace(m.input.Value())
-			m.modal = modalNone
-			m.input.Blur()
-			if cwd == "" {
-				return m, nil
-			}
-			name := filepath.Base(cwd)
-			return m, func() tea.Msg {
-				target, err := tmuxctl.SpawnClaude(cwd, name)
-				return spawnedMsg{cwd: cwd, target: target, err: err}
-			}
-		}
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
 	}
 
 	return m, nil
@@ -452,27 +554,91 @@ func (m Model) runCommand(cmd string) (Model, tea.Cmd) {
 	}
 }
 
-// attachCmd takes over the terminal to run `claude --resume`. Bubble Tea's
-// ExecProcess pauses the program and restores it on exit.
-func (m Model) attachCmd(id string) tea.Cmd {
+// attachCmd takes over the terminal so the user can interact with a running
+// claude session. Strategy:
+//
+//  1. If the running claude lives inside a tmux pane, attach to that tmux
+//     pane directly. This is a true attach — same process, same state, every
+//     keystroke is live in any other terminal also viewing the pane.
+//  2. Otherwise fall back to `claude --resume`, which spawns a new claude
+//     against the same on-disk transcript. State is duplicated and not live;
+//     this is what we used to do unconditionally.
+func (m Model) attachCmd(s claude.Session) tea.Cmd {
+	if target := m.findContainingPane(s.PID); target != "" {
+		return m.tmuxAttachCmd(target)
+	}
 	var c *exec.Cmd
 	if m.remote {
-		c = exec.Command("ssh", "-t", m.host, "claude", "--resume", id)
+		// `bash -lc` sources the remote login profile so PATH picks up tools
+		// installed under ~/.local/bin, asdf shims, nvm, etc. Without this,
+		// non-interactive ssh sees a minimal PATH and reports "command not found".
+		script := fmt.Sprintf("cd %s && exec claude --resume %s",
+			shellQuote(s.CWD), shellQuote(s.ID))
+		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
 	} else {
-		c = exec.Command("claude", "--resume", id)
+		c = exec.Command("claude", "--resume", s.ID)
+		c.Dir = s.CWD
 	}
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		return attachExitedMsg{err: err}
 	})
 }
 
-func remoteSendKeys(host, target, text string) error {
-	// Quote for shell — keep it simple; users can avoid exotic chars in prompts.
-	c := exec.Command("ssh", host, "tmux", "send-keys", "-t", target, "-l", text)
-	if err := c.Run(); err != nil {
-		return err
+func (m Model) findContainingPane(pid int) string {
+	if pid <= 0 {
+		return ""
 	}
-	c = exec.Command("ssh", host, "tmux", "send-keys", "-t", target, "Enter")
+	if m.remote {
+		full := "lookup() {" + tmuxctl.RemoteTmuxLookupScript + "}; lookup " + strconv.Itoa(pid)
+		out, err := exec.Command("ssh", m.host, "--", "bash", "-lc", full).Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
+	target, err := tmuxctl.FindPaneByPID(pid)
+	if err != nil {
+		return ""
+	}
+	return target
+}
+
+// tmuxAttachCmd attaches the user's terminal to an existing tmux pane.
+// Detach with the standard tmux prefix-d (Ctrl+B D by default) — this returns
+// to the whip TUI without killing the underlying claude.
+func (m Model) tmuxAttachCmd(target string) tea.Cmd {
+	// target is "session:window.pane"; tmux attach wants the session name.
+	session := target
+	if i := strings.IndexAny(target, ":"); i > 0 {
+		session = target[:i]
+	}
+
+	var c *exec.Cmd
+	if m.remote {
+		// Switch the session's active pane to the one we want, then attach.
+		script := fmt.Sprintf(
+			"tmux select-pane -t %s 2>/dev/null; exec tmux attach-session -t %s",
+			shellQuote(target), shellQuote(session))
+		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
+	} else {
+		// Same idea locally: nudge the active pane, then attach.
+		_ = exec.Command("tmux", "select-pane", "-t", target).Run()
+		c = exec.Command("tmux", "attach-session", "-t", session)
+	}
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return attachExitedMsg{err: err}
+	})
+}
+
+// shellQuote wraps s in single quotes for safe inclusion in a sh -c command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func remoteSendKeys(host, target, text string) error {
+	script := fmt.Sprintf("tmux send-keys -t %s -l %s && tmux send-keys -t %s Enter",
+		shellQuote(target), shellQuote(text), shellQuote(target))
+	c := exec.Command("ssh", host, "--", "bash", "-lc", script)
 	return c.Run()
 }
 
@@ -646,6 +812,19 @@ func (m *Model) layout() {
 	}
 }
 
+// followupWidth caps the textarea width so long prompts wrap instead of
+// expanding the modal indefinitely.
+func (m Model) followupWidth() int {
+	w := m.width - 12 // modal border + padding + buffer
+	if w > 80 {
+		w = 80
+	}
+	if w < 30 {
+		w = 30
+	}
+	return w
+}
+
 // listInnerWidth is the width available for a row's text content inside the
 // bordered list box.
 func (m Model) listInnerWidth() int {
@@ -720,7 +899,7 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderFooter() string {
-	hint := "j/k move  o attach  f follow-up  s spawn  / filter  : cmd  ? help  q quit"
+	hint := "j/k move  e expand  o attach  f follow-up  / filter  : cmd  ? help  q quit"
 	return Theme.Footer.Padding(0, 1).Render(hint)
 }
 
@@ -729,7 +908,7 @@ func (m Model) renderFooter() string {
 // "<dot> <cwd>     <preview…>      <age>".
 func (m Model) renderList(w, h int) string {
 	if len(m.sessions) == 0 {
-		return Theme.Hint.Render("no sessions yet — start `claude` or press s to spawn one")
+		return Theme.Hint.Render("no sessions yet — start `claude` somewhere and it'll show up")
 	}
 
 	// Group sessions by status. m.sessions is already sorted by tier+recency,
@@ -769,6 +948,9 @@ func (m Model) renderList(w, h int) string {
 		lines = append(lines, header)
 		for _, s := range g.items {
 			lines = append(lines, m.renderRow(s, w))
+			if s.ID == m.selected && m.expanded {
+				lines = append(lines, m.renderRepliesExpansion(s, w)...)
+			}
 		}
 	}
 
@@ -842,23 +1024,200 @@ func (m Model) renderRow(s claude.Session, w int) string {
 	return lipgloss.NewStyle().Width(w).Render(line)
 }
 
+const expandedReplyCount = 3
+
+// renderRepliesExpansion is the inline expansion shown under the selected
+// row when m.expanded is true. It animates open by progressively revealing
+// lines based on how long ago the user pressed `e`, and if the agent is
+// currently busy it shows a "thinking" indicator at the bottom.
+func (m Model) renderRepliesExpansion(s claude.Session, w int) []string {
+	const indent = "      "
+	innerW := w - len(indent)
+	if innerW < 10 {
+		innerW = 10
+	}
+
+	var lines []string
+
+	replies, loaded := m.replies[s.ID]
+	switch {
+	case !loaded:
+		lines = []string{indent + Theme.Hint.Render("loading…")}
+	case len(replies) == 0:
+		lines = []string{indent + Theme.Hint.Render("no replies yet")}
+	default:
+		// Apply typewriter reveal to the latest reply only.
+		display := make([]string, len(replies))
+		copy(display, replies)
+		if st, ok := m.replyReveal[s.ID]; ok && st.visible < len(st.target) {
+			display[len(display)-1] = string(st.target[:st.visible])
+		}
+		for i, r := range display {
+			marker := Theme.StatusIdle.Render("▸ ")
+			first := true
+			for _, ln := range wrapPlain(r, innerW-2) {
+				prefix := indent + "  "
+				if first {
+					prefix = indent + marker
+					first = false
+				}
+				lines = append(lines, prefix+Theme.RowDim.Render(ln))
+			}
+			// Trailing cursor on the latest reply while it's still revealing.
+			if i == len(display)-1 {
+				if st, ok := m.replyReveal[s.ID]; ok && st.visible < len(st.target) {
+					if n := len(lines); n > 0 {
+						lines[n-1] += Theme.StatusBusy.Render("▍")
+					}
+				}
+			}
+		}
+	}
+
+	if s.Status == claude.StatusBusy {
+		lines = append(lines,
+			indent+Theme.StatusBusy.Render(m.spinner.View()+" thinking…"))
+	}
+
+	// Reveal animation: progressive line count over expandAnimDuration.
+	elapsed := time.Since(m.expandStart)
+	if elapsed < expandAnimDuration && len(lines) > 0 {
+		ratio := float64(elapsed) / float64(expandAnimDuration)
+		visible := int(ratio*float64(len(lines))) + 1
+		if visible > len(lines) {
+			visible = len(lines)
+		}
+		lines = lines[:visible]
+	}
+
+	out := make([]string, len(lines))
+	for i, ln := range lines {
+		out[i] = lipgloss.NewStyle().Width(w).Render(ln)
+	}
+	return out
+}
+
+// updateReplyReveal compares old and new replies for a session and, if the
+// latest reply has grown (new tokens streamed in), schedules a typewriter
+// animation that reveals the new tail. Returns the animation command if one
+// should start, or nil. The reveal is only enabled while the user is looking
+// at the expansion for that session — otherwise we snap to fully revealed.
+func (m *Model) updateReplyReveal(id string, fresh []string) tea.Cmd {
+	if len(fresh) == 0 {
+		return nil
+	}
+	latest := fresh[len(fresh)-1]
+	if !m.expanded || id != m.selected {
+		// Not visible — keep animation state in sync but don't kick a tick.
+		m.replyReveal[id] = &replyRevealState{
+			target:  []rune(latest),
+			visible: len([]rune(latest)),
+			prefix:  len([]rune(latest)),
+		}
+		return nil
+	}
+
+	prev, hadPrev := m.replyReveal[id]
+	prevReplies := m.replies[id]
+	prevLatest := ""
+	if len(prevReplies) > 0 {
+		prevLatest = prevReplies[len(prevReplies)-1]
+	}
+
+	target := []rune(latest)
+
+	// New reply altogether (different message, or first time we see one):
+	// animate from scratch.
+	if !hadPrev || !strings.HasPrefix(latest, prevLatest) ||
+		len(prevReplies) != len(fresh) {
+		m.replyReveal[id] = &replyRevealState{target: target, visible: 0, prefix: 0}
+		return replyAnimTick(id)
+	}
+
+	// Same reply growing: keep what's been shown, animate the new tail.
+	prev.target = target
+	if prev.visible > len(target) {
+		prev.visible = len(target)
+	}
+	if prev.visible < len(target) {
+		return replyAnimTick(id)
+	}
+	return nil
+}
+
+// lastAssistantReplies pulls the trailing N assistant text replies out of a
+// transcript. Tool use/results and any non-text content are excluded so we
+// only show what Claude actually said back to the user.
+func lastAssistantReplies(events []claude.TranscriptEvent, n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	var out []string
+	for i := len(events) - 1; i >= 0 && len(out) < n; i-- {
+		e := events[i]
+		if e.Type != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(e.Text)
+		if text == "" {
+			continue
+		}
+		out = append([]string{text}, out...)
+	}
+	return out
+}
+
+// wrapPlain hard-wraps s at width w, breaking on spaces where possible. Used
+// for the dim reply text under the selected row — needs no ANSI awareness.
+func wrapPlain(s string, w int) []string {
+	if w <= 0 {
+		return []string{s}
+	}
+	s = strings.ReplaceAll(s, "\r", "")
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		para = strings.TrimRight(para, " \t")
+		if para == "" {
+			out = append(out, "")
+			continue
+		}
+		for len(para) > w {
+			cut := w
+			if i := strings.LastIndex(para[:w], " "); i > w/2 {
+				cut = i
+			}
+			out = append(out, strings.TrimRight(para[:cut], " "))
+			para = strings.TrimLeft(para[cut:], " ")
+		}
+		if para != "" {
+			out = append(out, para)
+		}
+	}
+	const maxLines = 4
+	if len(out) > maxLines {
+		out = out[:maxLines]
+		out[maxLines-1] = truncate(out[maxLines-1], w-1) + "…"
+	}
+	return out
+}
+
 func (m Model) overlayModal(base string) string {
 	var body string
 	switch m.modal {
 	case modalHelp:
 		body = m.renderHelp()
-	case modalFilter, modalCmd, modalFollowup, modalSpawn:
+	case modalFilter, modalCmd:
 		body = m.input.View()
 		switch m.modal {
 		case modalFilter:
 			body = "Filter sessions\n\n" + body + "\n\nEnter to apply  Esc to cancel"
 		case modalCmd:
 			body = "Command\n\n" + body + "\n\n:q  :filter <text>"
-		case modalFollowup:
-			body = "Send follow-up to whip-managed session\n\n" + body
-		case modalSpawn:
-			body = "Spawn new Claude session\n\n" + body + "\n\n(absolute path)"
 		}
+	case modalFollowup:
+		body = "Send follow-up → " + m.followupTarget + "\n\n" +
+			m.textarea.View() + "\n\n" +
+			Theme.Hint.Render("Enter newline  Ctrl+D send  Esc cancel")
 	}
 	box := Theme.Modal.Render(body)
 	bw := lipgloss.Width(box)
@@ -876,8 +1235,8 @@ func (m Model) renderHelp() string {
 		{"/", "filter"},
 		{"n / N", "next / prev match"},
 		{"o, ↵", "attach (claude --resume)"},
+		{"e", "expand recent replies"},
 		{"f", "send follow-up (whip-managed)"},
-		{"s", "spawn new claude in tmux"},
 		{"r", "refresh now"},
 		{":", "command (e.g. :q)"},
 		{"q, ^c", "quit"},

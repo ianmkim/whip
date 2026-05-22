@@ -18,7 +18,7 @@ type KeyMap struct {
 	PrevMatch  key.Binding // N
 	Attach     key.Binding // o or Enter
 	Followup   key.Binding // f
-	Spawn      key.Binding // s
+	Expand     key.Binding // e — toggle reply expansion under selected row
 	Refresh    key.Binding // r
 	Help       key.Binding // ?
 	Cmd        key.Binding // : modal command
@@ -42,7 +42,7 @@ func DefaultKeyMap() KeyMap {
 		PrevMatch: key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev")),
 		Attach:    key.NewBinding(key.WithKeys("o", "enter"), key.WithHelp("o/↵", "attach")),
 		Followup:  key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "follow-up")),
-		Spawn:     key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "spawn")),
+		Expand:    key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "expand replies")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Cmd:       key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command")),
