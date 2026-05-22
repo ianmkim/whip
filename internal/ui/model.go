@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -55,6 +56,7 @@ type Model struct {
 	previews     map[string]string                  // sessionId -> short last-line summary
 	previewKey   map[string]time.Time               // last UpdatedAt the preview was sourced from
 	replies      map[string][]string                // sessionId -> last few assistant text replies (oldest→newest)
+	branches     map[string]branchEntry             // cwd -> last-known branch + lookup time
 
 	expanded    bool      // whether the selected row is expanded
 	expandStart time.Time // wall clock at which the reveal animation began
@@ -114,6 +116,7 @@ func NewModel(src source.Source, notifier *notify.Notifier, store *aliases.Store
 		replies:     map[string][]string{},
 		replyReveal: map[string]*replyRevealState{},
 		firstSeen:   map[string]time.Time{},
+		branches:    map[string]branchEntry{},
 	}
 }
 
@@ -938,6 +941,51 @@ func (m Model) displayName(s claude.Session) string {
 	return "(unnamed)"
 }
 
+// branchEntry caches a cwd's git branch so we don't hit the filesystem on
+// every render. Empty Name means "checked, not a git repo or detached HEAD".
+type branchEntry struct {
+	Name      string
+	CheckedAt time.Time
+}
+
+const branchCacheTTL = 30 * time.Second
+
+// sessionBranch returns the git branch for a session's cwd, using a short
+// TTL cache. Only resolves for local sessions — remote cwds are skipped
+// because we'd need to shell over SSH.
+func (m *Model) sessionBranch(s claude.Session) string {
+	if m.remote || s.CWD == "" {
+		return ""
+	}
+	if e, ok := m.branches[s.CWD]; ok && time.Since(e.CheckedAt) < branchCacheTTL {
+		return e.Name
+	}
+	name := readGitBranch(s.CWD)
+	m.branches[s.CWD] = branchEntry{Name: name, CheckedAt: time.Now()}
+	return name
+}
+
+// readGitBranch parses .git/HEAD upward from dir. Returns "" if no repo or
+// detached HEAD.
+func readGitBranch(dir string) string {
+	for i := 0; i < 40; i++ {
+		head := filepath.Join(dir, ".git", "HEAD")
+		if data, err := os.ReadFile(head); err == nil {
+			line := strings.TrimSpace(string(data))
+			if ref, ok := strings.CutPrefix(line, "ref: refs/heads/"); ok {
+				return ref
+			}
+			return ""
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+	return ""
+}
+
 func (m Model) setToast(text string) Model {
 	m.toast = text
 	m.toastClearAt = time.Now().Add(3 * time.Second)
@@ -1125,6 +1173,9 @@ func (m Model) renderRow(s claude.Session, w int) string {
 	}
 
 	label := m.displayName(s)
+	if branch := m.sessionBranch(s); branch != "" {
+		label = label + Theme.Hint.Render(" "+branch)
+	}
 	age := relTime(s.UpdatedAt)
 
 	preview := s.Preview
