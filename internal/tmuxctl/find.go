@@ -80,19 +80,44 @@ func localParentPID(pid int) (int, error) {
 }
 
 // RemoteTmuxLookupScript is a small POSIX shell program that, given a pid as
-// $1, prints the containing tmux target (e.g. "work:0.0") or nothing. We pipe
-// it over SSH for remote sources. Kept here so the attach code can inline it.
+// $1, prints "WHIP::<target>::END" where <target> is the containing tmux
+// target (e.g. "work:0.0") or empty. We wrap the result in sentinels because
+// bash -lc on the remote side may source a profile that prints banner / MOTD
+// text to stdout — the caller has to extract the result substring rather
+// than trusting the full output.
 const RemoteTmuxLookupScript = `
 pid="$1"
-panes=$(tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null) || exit 0
-cur=$pid
-i=0
-while [ "$cur" -gt 1 ] && [ "$i" -lt 32 ]; do
-  match=$(printf '%s\n' "$panes" | awk -v p="$cur" '$1==p {print $2; exit}')
-  if [ -n "$match" ]; then printf '%s' "$match"; exit 0; fi
-  next=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
-  [ -z "$next" ] && break
-  cur=$next
-  i=$((i+1))
-done
+result=""
+panes=$(tmux list-panes -a -F '#{pane_pid} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+if [ -n "$panes" ]; then
+  cur=$pid
+  i=0
+  while [ "$cur" -gt 1 ] && [ "$i" -lt 32 ]; do
+    match=$(printf '%s\n' "$panes" | awk -v p="$cur" '$1==p {print $2; exit}')
+    if [ -n "$match" ]; then result="$match"; break; fi
+    next=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+    [ -z "$next" ] && break
+    cur=$next
+    i=$((i+1))
+  done
+fi
+printf 'WHIP::%s::END\n' "$result"
 `
+
+// ParseRemoteLookup extracts the tmux target from the sentinel-wrapped output
+// of RemoteTmuxLookupScript, ignoring any profile noise printed before the
+// sentinel. Returns "" if no pane was found or the sentinel is missing.
+func ParseRemoteLookup(out string) string {
+	const start = "WHIP::"
+	const end = "::END"
+	i := strings.Index(out, start)
+	if i < 0 {
+		return ""
+	}
+	rest := out[i+len(start):]
+	j := strings.Index(rest, end)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
+}

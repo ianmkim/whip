@@ -661,12 +661,19 @@ func (m Model) findContainingPane(pid int) string {
 		return ""
 	}
 	if m.remote {
-		full := "lookup() {" + tmuxctl.RemoteTmuxLookupScript + "}; lookup " + strconv.Itoa(pid)
-		out, err := exec.Command("ssh", m.host, "--", "bash", "-lc", full).Output()
+		// Run the lookup over SSH. We pass the script on stdin and the pid as
+		// an argument: `sh -s <pid>`. Using `sh` (not `bash -lc`) avoids
+		// sourcing the user's login profile, which on many hosts prints a
+		// banner/MOTD or chats over stdout and corrupts the result. We also
+		// always parse via the WHIP::<target>::END sentinel so any noise
+		// emitted before/after the script's printf is harmless.
+		c := exec.Command("ssh", m.host, "--", "sh", "-s", strconv.Itoa(pid))
+		c.Stdin = strings.NewReader(tmuxctl.RemoteTmuxLookupScript)
+		out, err := c.Output()
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(string(out))
+		return tmuxctl.ParseRemoteLookup(string(out))
 	}
 	target, err := tmuxctl.FindPaneByPID(pid)
 	if err != nil {
