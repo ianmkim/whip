@@ -1,0 +1,4 @@
+/whip
+*.test
+*.out
+.DS_Store
