@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/adrian/whip/internal/aliases"
 	"github.com/adrian/whip/internal/notify"
 	"github.com/adrian/whip/internal/source"
 	"github.com/adrian/whip/internal/ui"
@@ -57,7 +58,12 @@ func run(host string) error {
 		return fmt.Errorf("watch: %w", err)
 	}
 
-	model := ui.NewModel(src, notify.New(), remote, hostLabel(host))
+	store, err := aliases.Load("")
+	if err != nil {
+		return fmt.Errorf("load aliases: %w", err)
+	}
+
+	model := ui.NewModel(src, notify.New(), store, remote, hostLabel(host))
 	prog := tea.NewProgram(model, tea.WithAltScreen())
 
 	go pumpWatch(prog, watchCh)

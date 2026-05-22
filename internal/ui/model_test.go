@@ -33,7 +33,7 @@ func TestViewWithSessions(t *testing.T) {
 		{ID: "a", CWD: "/x/y/proj1", Status: claude.StatusBusy, UpdatedAt: time.Now()},
 		{ID: "b", CWD: "/x/y/proj2", Status: claude.StatusIdle, UpdatedAt: time.Now().Add(-time.Hour)},
 	}}
-	m := NewModel(src, nil, false, "local")
+	m := NewModel(src, nil, nil, false, "local")
 	upd, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	upd, _ = upd.Update(sessionsLoadedMsg{sessions: src.sessions})
 	out := upd.View()
@@ -51,7 +51,7 @@ func TestVimChordGG(t *testing.T) {
 		{ID: "b", CWD: "/x/y/p2", Status: claude.StatusIdle, UpdatedAt: time.Now().Add(-time.Minute)},
 		{ID: "c", CWD: "/x/y/p3", Status: claude.StatusIdle, UpdatedAt: time.Now().Add(-time.Hour)},
 	}}
-	m := NewModel(src, nil, false, "local")
+	m := NewModel(src, nil, nil, false, "local")
 	upd, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	upd, _ = upd.Update(sessionsLoadedMsg{sessions: src.sessions})
 	mm := upd.(Model)

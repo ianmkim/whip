@@ -20,6 +20,7 @@ type KeyMap struct {
 	Followup   key.Binding // f
 	Expand     key.Binding // e — toggle reply expansion under selected row
 	Refresh    key.Binding // r
+	Rename     key.Binding // R
 	Help       key.Binding // ?
 	Cmd        key.Binding // : modal command
 	Quit       key.Binding // q (only outside modal)
@@ -44,6 +45,7 @@ func DefaultKeyMap() KeyMap {
 		Followup:  key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "follow-up")),
 		Expand:    key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "expand replies")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Rename:    key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "rename")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Cmd:       key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "command")),
 		Quit:      key.NewBinding(key.WithKeys("q"), key.WithHelp("q", "quit")),

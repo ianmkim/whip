@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adrian/whip/internal/aliases"
 	"github.com/adrian/whip/internal/claude"
 	"github.com/adrian/whip/internal/notify"
 	"github.com/adrian/whip/internal/source"
@@ -31,12 +32,14 @@ const (
 	modalFilter
 	modalCmd
 	modalFollowup
+	modalRename
 	modalHelp
 )
 
 type Model struct {
 	src      source.Source
 	notifier *notify.Notifier
+	aliases  *aliases.Store
 	remote   bool // true when source is an SSH host
 	host     string
 
@@ -62,6 +65,7 @@ type Model struct {
 	replyReveal map[string]*replyRevealState
 
 	followupTarget string // tmux target captured when the followup modal opened
+	renameTarget   string // sessionID captured when the rename modal opened
 
 	filter   string
 	matches  []int // indices into m.sessions for n/N
@@ -80,7 +84,7 @@ type Model struct {
 	toastClearAt time.Time
 }
 
-func NewModel(src source.Source, notifier *notify.Notifier, remote bool, host string) Model {
+func NewModel(src source.Source, notifier *notify.Notifier, store *aliases.Store, remote bool, host string) Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
 	sp.Style = Theme.StatusBusy
@@ -98,6 +102,7 @@ func NewModel(src source.Source, notifier *notify.Notifier, remote bool, host st
 	return Model{
 		src:        src,
 		notifier:   notifier,
+		aliases:    store,
 		remote:     remote,
 		host:       host,
 		keys:       DefaultKeyMap(),
@@ -397,6 +402,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.Refresh) {
 		return m, loadInitial(m.src)
 	}
+	if key.Matches(msg, m.keys.Rename) {
+		return m.openRenameModal()
+	}
 
 	// vim chord: gg
 	if msg.String() == "g" {
@@ -542,9 +550,55 @@ func (m Model) handleModalKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.textarea, cmd = m.textarea.Update(msg)
 		return m, cmd
 
+	case modalRename:
+		if msg.Type == tea.KeyEnter {
+			val := strings.TrimSpace(m.input.Value())
+			id := m.renameTarget
+			m.modal = modalNone
+			m.input.Blur()
+			return m.applyRename(id, val)
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return m, cmd
+
 	}
 
 	return m, nil
+}
+
+// openRenameModal seeds the textinput with the current display name and
+// switches into modalRename. Empty input on submit clears the alias.
+func (m Model) openRenameModal() (Model, tea.Cmd) {
+	s := m.findSession(m.selected)
+	if s == nil {
+		return m, nil
+	}
+	if m.aliases == nil {
+		return m.setToast("rename unavailable: alias store not loaded"),
+			toastClearCmd(3 * time.Second)
+	}
+	m.renameTarget = s.ID
+	m.modal = modalRename
+	m.input.Prompt = "name: "
+	m.input.SetValue(m.displayName(*s))
+	m.input.Focus()
+	return m, textinput.Blink
+}
+
+// applyRename writes the alias to the store and emits a toast describing the
+// outcome. Empty `val` removes the override.
+func (m Model) applyRename(id, val string) (Model, tea.Cmd) {
+	if id == "" || m.aliases == nil {
+		return m, nil
+	}
+	if err := m.aliases.Set(id, val); err != nil {
+		return m.setToast("rename failed: " + err.Error()), toastClearCmd(3 * time.Second)
+	}
+	if val == "" {
+		return m.setToast("alias cleared"), toastClearCmd(2 * time.Second)
+	}
+	return m.setToast("renamed → " + val), toastClearCmd(2 * time.Second)
 }
 
 func (m Model) runCommand(cmd string) (Model, tea.Cmd) {
@@ -555,6 +609,11 @@ func (m Model) runCommand(cmd string) (Model, tea.Cmd) {
 		m.filter = strings.TrimSpace(strings.TrimPrefix(cmd, "filter "))
 		m.refreshMatches()
 		return m, nil
+	case strings.HasPrefix(cmd, "rename "):
+		val := strings.TrimSpace(strings.TrimPrefix(cmd, "rename "))
+		return m.applyRename(m.selected, val)
+	case cmd == "unrename":
+		return m.applyRename(m.selected, "")
 	case cmd == "":
 		return m, nil
 	default:
@@ -582,10 +641,12 @@ func (m Model) attachCmd(s claude.Session) tea.Cmd {
 		// non-interactive ssh sees a minimal PATH and reports "command not found".
 		// TERM is forced to xterm-256color so exotic local terminals (e.g.
 		// xterm-kitty) don't trip "missing or unsuitable terminal" on hosts
-		// that lack the matching terminfo entry.
-		script := fmt.Sprintf("export TERM=xterm-256color; cd %s && exec claude --resume %s",
+		// that lack the matching terminfo entry. Using `env -` clears the
+		// inherited TERM before bash starts so a login profile can't readopt it.
+		script := fmt.Sprintf("cd %s && exec claude --resume %s",
 			shellQuote(s.CWD), shellQuote(s.ID))
-		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
+		c = exec.Command("ssh", "-t", m.host, "--",
+			"env", "TERM=xterm-256color", "bash", "-lc", script)
 	} else {
 		c = exec.Command("claude", "--resume", s.ID)
 		c.Dir = s.CWD
@@ -618,23 +679,41 @@ func (m Model) findContainingPane(pid int) string {
 // Detach with the standard tmux prefix-d (Ctrl+B D by default) — this returns
 // to the whip TUI without killing the underlying claude.
 func (m Model) tmuxAttachCmd(target string) tea.Cmd {
-	// target is "session:window.pane"; tmux attach wants the session name.
-	session := target
+	// target is "session:window.pane". We need all three parts: attach-session
+	// only takes a session, and select-pane on its own won't change the
+	// session's *active window* — so attaching after select-pane lands on
+	// whichever window happened to be active before, not the one with the
+	// claude we're trying to reach.
+	session, window := target, ""
 	if i := strings.IndexAny(target, ":"); i > 0 {
 		session = target[:i]
+		rest := target[i+1:]
+		if j := strings.IndexAny(rest, "."); j > 0 {
+			window = rest[:j]
+		} else {
+			window = rest
+		}
+	}
+	winTarget := session
+	if window != "" {
+		winTarget = session + ":" + window
 	}
 
 	var c *exec.Cmd
 	if m.remote {
-		// Switch the session's active pane to the one we want, then attach.
-		// Force TERM to xterm-256color so the remote tmux doesn't reject our
-		// local terminal (e.g. xterm-kitty) when its terminfo isn't installed.
+		// Switch the active window, then the active pane within it, then
+		// attach. Force TERM to xterm-256color via `env` so the remote tmux
+		// doesn't reject our local terminal (e.g. xterm-kitty) when its
+		// terminfo isn't installed; setting it on the env line beats any
+		// profile that might re-export TERM from SSH_* vars.
 		script := fmt.Sprintf(
-			"export TERM=xterm-256color; tmux select-pane -t %s 2>/dev/null; exec tmux attach-session -t %s",
-			shellQuote(target), shellQuote(session))
-		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
+			"tmux select-window -t %s 2>/dev/null; tmux select-pane -t %s 2>/dev/null; exec tmux attach-session -t %s",
+			shellQuote(winTarget), shellQuote(target), shellQuote(session))
+		c = exec.Command("ssh", "-t", m.host, "--",
+			"env", "TERM=xterm-256color", "bash", "-lc", script)
 	} else {
-		// Same idea locally: nudge the active pane, then attach.
+		// Same idea locally: select window, select pane, then attach.
+		_ = exec.Command("tmux", "select-window", "-t", winTarget).Run()
 		_ = exec.Command("tmux", "select-pane", "-t", target).Run()
 		c = exec.Command("tmux", "attach-session", "-t", session)
 	}
@@ -759,7 +838,7 @@ func (m *Model) refreshMatches() {
 	}
 	needle := strings.ToLower(m.filter)
 	for i, s := range m.sessions {
-		hay := strings.ToLower(s.CWD + " " + s.Name + " " + s.Status.String())
+		hay := strings.ToLower(s.CWD + " " + s.Name + " " + m.displayName(s) + " " + s.Status.String())
 		if strings.Contains(hay, needle) {
 			m.matches = append(m.matches, i)
 		}
@@ -792,22 +871,43 @@ func (m Model) handleStatusTransition(prev *claude.Session, next claude.Session)
 	if prev == nil {
 		return
 	}
-	cwd := filepath.Base(next.CWD)
+	label := m.displayName(next)
 	if prev.Status == claude.StatusBusy && next.Status == claude.StatusIdle {
 		m.notifier.Send(next.ID+":idle",
 			"Claude finished",
-			fmt.Sprintf("%s — %s", cwd, m.host))
+			fmt.Sprintf("%s — %s", label, m.host))
 	}
 	if prev.Status != claude.StatusNeedsInput && next.Status == claude.StatusNeedsInput {
 		m.notifier.Send(next.ID+":need",
 			"Claude needs input",
-			fmt.Sprintf("%s — %s", cwd, m.host))
+			fmt.Sprintf("%s — %s", label, m.host))
 	}
 	if prev.Status != claude.StatusStopped && next.Status == claude.StatusStopped {
 		m.notifier.Send(next.ID+":stop",
 			"Claude session stopped",
-			fmt.Sprintf("%s — %s", cwd, m.host))
+			fmt.Sprintf("%s — %s", label, m.host))
 	}
+}
+
+// displayName resolves the visible label for a session. Order of preference:
+// user-set alias from the sidecar store → name field claude wrote in the JSON
+// → cwd basename → cwd → "(unnamed)".
+func (m Model) displayName(s claude.Session) string {
+	if m.aliases != nil {
+		if a := m.aliases.Get(s.ID); a != "" {
+			return a
+		}
+	}
+	if s.Name != "" {
+		return s.Name
+	}
+	if base := filepath.Base(s.CWD); base != "" && base != "." && base != "/" {
+		return base
+	}
+	if s.CWD != "" {
+		return s.CWD
+	}
+	return "(unnamed)"
 }
 
 func (m Model) setToast(text string) Model {
@@ -912,7 +1012,7 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderFooter() string {
-	hint := "j/k move  e expand  o attach  f follow-up  / filter  : cmd  ? help  q quit"
+	hint := "j/k move  e expand  o attach  f follow-up  R rename  / filter  : cmd  ? help  q quit"
 	return Theme.Footer.Padding(0, 1).Render(hint)
 }
 
@@ -992,10 +1092,7 @@ func (m Model) renderRow(s claude.Session, w int) string {
 		dot = gStyle.Render(m.spinner.View())
 	}
 
-	cwd := filepath.Base(s.CWD)
-	if cwd == "" {
-		cwd = s.CWD
-	}
+	label := m.displayName(s)
 	age := relTime(s.UpdatedAt)
 
 	preview := s.Preview
@@ -1003,8 +1100,8 @@ func (m Model) renderRow(s claude.Session, w int) string {
 		preview = p
 	}
 
-	// Layout: "  <dot> <cwd>   <preview>          <age>"
-	left := "  " + dot + " " + cwd
+	// Layout: "  <dot> <label>   <preview>          <age>"
+	left := "  " + dot + " " + label
 	leftW := lipgloss.Width(left)
 
 	// Reserve right side for age (padded to a fixed slot for alignment).
@@ -1233,12 +1330,15 @@ func (m Model) overlayModal(base string) string {
 		case modalFilter:
 			body = "Filter sessions\n\n" + body + "\n\nEnter to apply  Esc to cancel"
 		case modalCmd:
-			body = "Command\n\n" + body + "\n\n:q  :filter <text>"
+			body = "Command\n\n" + body + "\n\n:q  :filter <text>  :rename <text>  :unrename"
 		}
 	case modalFollowup:
 		body = "Send follow-up → " + m.followupTarget + "\n\n" +
 			m.textarea.View() + "\n\n" +
 			Theme.Hint.Render("Enter newline  Ctrl+D send  Esc cancel")
+	case modalRename:
+		body = "Rename session\n\n" + m.input.View() + "\n\n" +
+			Theme.Hint.Render("Enter to save  empty to clear  Esc to cancel")
 	}
 	box := Theme.Modal.Render(body)
 	bw := lipgloss.Width(box)
@@ -1259,7 +1359,8 @@ func (m Model) renderHelp() string {
 		{"e", "expand recent replies"},
 		{"f", "send follow-up (whip-managed)"},
 		{"r", "refresh now"},
-		{":", "command (e.g. :q)"},
+		{"R", "rename selected session"},
+		{":", "command (e.g. :q, :rename foo)"},
 		{"q, ^c", "quit"},
 		{"esc", "cancel modal"},
 	}
