@@ -967,9 +967,9 @@ func (m Model) followupWidth() int {
 }
 
 // listInnerWidth is the width available for a row's text content inside the
-// bordered list box.
+// list area.
 func (m Model) listInnerWidth() int {
-	w := m.width - 4 // 2 border + 2 padding
+	w := m.width - 2 // 2 padding
 	if w < 20 {
 		w = 20
 	}
@@ -977,7 +977,7 @@ func (m Model) listInnerWidth() int {
 }
 
 func (m Model) listInnerHeight() int {
-	h := m.height - 4 // header + footer + 2 borders
+	h := m.height - 5 // 3-line header + divider + footer
 	if h < 4 {
 		h = 4
 	}
@@ -996,13 +996,15 @@ func (m Model) View() string {
 	innerW := m.listInnerWidth()
 	innerH := m.listInnerHeight()
 
-	body := Theme.BorderActive.
+	body := lipgloss.NewStyle().
 		Width(innerW + 2).
 		Height(innerH).
 		Padding(0, 1).
 		Render(m.renderList(innerW, innerH))
 
-	v := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	divider := Theme.HeaderDim.Render(strings.Repeat("─", m.width))
+
+	v := lipgloss.JoinVertical(lipgloss.Left, header, divider, body, footer)
 
 	if m.modal != modalNone {
 		v = m.overlayModal(v)
@@ -1036,7 +1038,9 @@ func (m Model) renderHeader() string {
 			Theme.StatusBusy.Render(fmt.Sprintf("%s %d busy", m.spinner.View(), busy)),
 		)
 	}
-	return lipgloss.NewStyle().Padding(0, 1).Render(strings.Join(parts, " "))
+	icon := Theme.Title.Render(Icon)
+	line := strings.Join(parts, " ")
+	return lipgloss.NewStyle().Padding(0, 1).Render(icon + "\n" + line)
 }
 
 func (m Model) renderFooter() string {
