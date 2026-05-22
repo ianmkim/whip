@@ -30,12 +30,18 @@ func ParseSession(data []byte) (Session, error) {
 		UpdatedAt: msToTime(raw.UpdatedAt),
 	}
 	switch strings.ToLower(raw.Status) {
+	case "":
+		s.Status = StatusUnknown
 	case "idle":
 		s.Status = StatusIdle
 	case "busy":
 		s.Status = StatusBusy
 	default:
-		s.Status = StatusUnknown
+		// Claude writes a third status while a tool-use permission prompt is
+		// pending (e.g. "input_required" / "waiting"). Anything that isn't
+		// idle, busy, or empty means the agent is alive but stalled on the
+		// user — surface it as NeedsInput so the row stays visible.
+		s.Status = StatusNeedsInput
 	}
 	return s, nil
 }

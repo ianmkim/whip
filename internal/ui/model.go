@@ -219,10 +219,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if _, ok := m.firstSeen[msg.session.ID]; !ok {
 			m.firstSeen[msg.session.ID] = time.Now()
 		}
-		prev := m.findSession(msg.session.ID)
+		// Snapshot the previous record by value before upsert overwrites it.
+		// findSession returns a pointer into m.sessions, and upsertSession
+		// mutates that slot in place — without a copy, prev.Status would
+		// equal next.Status by the time we check for a transition.
+		var prevSnap *claude.Session
+		if p := m.findSession(msg.session.ID); p != nil {
+			snap := *p
+			prevSnap = &snap
+		}
 		m.upsertSession(msg.session)
 		m.sortSessions()
-		m.handleStatusTransition(prev, msg.session)
+		m.handleStatusTransition(prevSnap, msg.session)
 		if msg.session.ID == m.selected {
 			cmds = append(cmds, m.maybeLoadPreview())
 		}
@@ -572,7 +580,10 @@ func (m Model) attachCmd(s claude.Session) tea.Cmd {
 		// `bash -lc` sources the remote login profile so PATH picks up tools
 		// installed under ~/.local/bin, asdf shims, nvm, etc. Without this,
 		// non-interactive ssh sees a minimal PATH and reports "command not found".
-		script := fmt.Sprintf("cd %s && exec claude --resume %s",
+		// TERM is forced to xterm-256color so exotic local terminals (e.g.
+		// xterm-kitty) don't trip "missing or unsuitable terminal" on hosts
+		// that lack the matching terminfo entry.
+		script := fmt.Sprintf("export TERM=xterm-256color; cd %s && exec claude --resume %s",
 			shellQuote(s.CWD), shellQuote(s.ID))
 		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
 	} else {
@@ -616,8 +627,10 @@ func (m Model) tmuxAttachCmd(target string) tea.Cmd {
 	var c *exec.Cmd
 	if m.remote {
 		// Switch the session's active pane to the one we want, then attach.
+		// Force TERM to xterm-256color so the remote tmux doesn't reject our
+		// local terminal (e.g. xterm-kitty) when its terminfo isn't installed.
 		script := fmt.Sprintf(
-			"tmux select-pane -t %s 2>/dev/null; exec tmux attach-session -t %s",
+			"export TERM=xterm-256color; tmux select-pane -t %s 2>/dev/null; exec tmux attach-session -t %s",
 			shellQuote(target), shellQuote(session))
 		c = exec.Command("ssh", "-t", m.host, "--", "bash", "-lc", script)
 	} else {
@@ -924,11 +937,19 @@ func (m Model) renderList(w, h int) string {
 		{claude.StatusStopped, "Stopped", nil},
 	}
 	for _, s := range m.sessions {
+		matched := false
 		for i := range groups {
 			if groups[i].status == s.Status {
 				groups[i].items = append(groups[i].items, s)
+				matched = true
 				break
 			}
+		}
+		// Anything we don't recognize (e.g. a future status string from
+		// claude) gets surfaced under "Needs input" so the row never
+		// silently disappears from the list.
+		if !matched {
+			groups[0].items = append(groups[0].items, s)
 		}
 	}
 

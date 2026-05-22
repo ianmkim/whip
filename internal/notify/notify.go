@@ -3,6 +3,7 @@
 package notify
 
 import (
+	"os/exec"
 	"sync"
 	"time"
 
@@ -32,6 +33,13 @@ func (n *Notifier) Send(key, title, body string) {
 	}
 	n.last[key] = now
 	n.mu.Unlock()
-	// best-effort; ignore errors so a missing dbus etc. does not crash the UI
-	_ = beeep.Notify(title, body, "")
+
+	if err := beeep.Notify(title, body, ""); err == nil {
+		return
+	}
+	// Fallback: many Linux desktops have notify-send available even when
+	// beeep's DBus path fails (e.g. minimal sessions without WAYLAND_DISPLAY).
+	if path, err := exec.LookPath("notify-send"); err == nil {
+		_ = exec.Command(path, title, body).Run()
+	}
 }
