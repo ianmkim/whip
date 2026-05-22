@@ -370,9 +370,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if s == nil {
 			return m, nil
 		}
-		target := m.findContainingPane(s.PID)
+		target, err := m.findContainingPane(s.PID)
+		if err != nil {
+			return m.setToast("pane lookup: " + err.Error()),
+				toastClearCmd(5 * time.Second)
+		}
 		if target == "" {
-			return m.setToast("not in tmux; press o to attach"),
+			return m.setToast("session pid not inside any tmux pane"),
 				toastClearCmd(3 * time.Second)
 		}
 		m.followupTarget = target
@@ -631,8 +635,17 @@ func (m Model) runCommand(cmd string) (Model, tea.Cmd) {
 //     against the same on-disk transcript. State is duplicated and not live;
 //     this is what we used to do unconditionally.
 func (m Model) attachCmd(s claude.Session) tea.Cmd {
-	if target := m.findContainingPane(s.PID); target != "" {
+	target, lookupErr := m.findContainingPane(s.PID)
+	if target != "" {
 		return m.tmuxAttachCmd(target)
+	}
+	// If we couldn't even run the lookup (ssh transport error, etc.) the user
+	// probably wants to know rather than have us silently spawn a duplicate
+	// claude process via --resume.
+	if lookupErr != nil {
+		return func() tea.Msg {
+			return toastMsg{text: "pane lookup: " + lookupErr.Error()}
+		}
 	}
 	var c *exec.Cmd
 	if m.remote {
@@ -656,30 +669,38 @@ func (m Model) attachCmd(s claude.Session) tea.Cmd {
 	})
 }
 
-func (m Model) findContainingPane(pid int) string {
+// findContainingPane returns the tmux target string ("session:window.pane")
+// for the pane that hosts pid, or "" with a non-nil err if something went
+// wrong. A nil err with empty target means the lookup ran cleanly but the pid
+// isn't inside any tmux pane (e.g. claude was started outside tmux).
+func (m Model) findContainingPane(pid int) (string, error) {
 	if pid <= 0 {
-		return ""
+		return "", fmt.Errorf("invalid pid %d", pid)
 	}
 	if m.remote {
-		// Run the lookup over SSH. We pass the script on stdin and the pid as
-		// an argument: `sh -s <pid>`. Using `sh` (not `bash -lc`) avoids
-		// sourcing the user's login profile, which on many hosts prints a
-		// banner/MOTD or chats over stdout and corrupts the result. We also
-		// always parse via the WHIP::<target>::END sentinel so any noise
-		// emitted before/after the script's printf is harmless.
+		// Pipe the script in over stdin and pass the pid as an argument:
+		// `sh -s <pid>`. We avoid `bash -lc` because login profiles often
+		// print banner/MOTD text to stdout and corrupt the result. The
+		// sentinel parse below tolerates any noise that does leak through.
+		var stderr strings.Builder
 		c := exec.Command("ssh", m.host, "--", "sh", "-s", strconv.Itoa(pid))
 		c.Stdin = strings.NewReader(tmuxctl.RemoteTmuxLookupScript)
+		c.Stderr = &stderr
 		out, err := c.Output()
 		if err != nil {
-			return ""
+			msg := strings.TrimSpace(stderr.String())
+			if msg == "" {
+				msg = err.Error()
+			}
+			return "", fmt.Errorf("ssh lookup: %s", msg)
 		}
-		return tmuxctl.ParseRemoteLookup(string(out))
+		return tmuxctl.ParseRemoteLookup(string(out)), nil
 	}
 	target, err := tmuxctl.FindPaneByPID(pid)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return target
+	return target, nil
 }
 
 // tmuxAttachCmd attaches the user's terminal to an existing tmux pane.
