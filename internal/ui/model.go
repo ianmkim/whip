@@ -222,7 +222,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.setToast("attach error: " + msg.err.Error())
 			cmds = append(cmds, toastClearCmd(3*time.Second))
 		}
-		// reload transcript — likely changed during attach
 		if m.selected != "" {
 			cmds = append(cmds, loadTranscript(m.src, m.selected))
 		}
@@ -601,11 +600,7 @@ func (m Model) maybeLoadPreview() tea.Cmd {
 	if s == nil {
 		return nil
 	}
-	if last, ok := m.transcriptKey[s.ID]; ok && last.Equal(s.UpdatedAt) {
-		// Cached; just re-render.
-		if events, ok2 := m.transcript[s.ID]; ok2 {
-			m.viewport.SetContent(m.renderTranscript(events))
-		}
+	if last, ok := m.previewKey[s.ID]; ok && last.Equal(s.UpdatedAt) {
 		return nil
 	}
 	return loadTranscript(m.src, s.ID)
@@ -645,23 +640,28 @@ func (m Model) setToast(text string) Model {
 // --- layout ---
 
 func (m *Model) layout() {
-	listW := m.width / 2
-	if listW < 28 {
-		listW = 28
+	// Content height = total - header - footer - 2 border lines.
+	if m.height < 8 {
+		return
 	}
-	if listW > 56 {
-		listW = 56
+}
+
+// listInnerWidth is the width available for a row's text content inside the
+// bordered list box.
+func (m Model) listInnerWidth() int {
+	w := m.width - 4 // 2 border + 2 padding
+	if w < 20 {
+		w = 20
 	}
-	detailW := m.width - listW - 4 // borders + gap
-	if detailW < 20 {
-		detailW = 20
+	return w
+}
+
+func (m Model) listInnerHeight() int {
+	h := m.height - 4 // header + footer + 2 borders
+	if h < 4 {
+		h = 4
 	}
-	contentH := m.height - 4 // header + footer + borders
-	if contentH < 5 {
-		contentH = 5
-	}
-	m.viewport.Width = detailW
-	m.viewport.Height = contentH
+	return h
 }
 
 // --- view ---
@@ -673,31 +673,14 @@ func (m Model) View() string {
 	header := m.renderHeader()
 	footer := m.renderFooter()
 
-	listW := m.width / 2
-	if listW < 28 {
-		listW = 28
-	}
-	if listW > 56 {
-		listW = 56
-	}
-	detailW := m.width - listW - 4
-	contentH := m.height - 4
-	if contentH < 5 {
-		contentH = 5
-	}
+	innerW := m.listInnerWidth()
+	innerH := m.listInnerHeight()
 
-	listStyle := Theme.Border
-	detailStyle := Theme.Border
-	if m.rightFocused {
-		detailStyle = Theme.BorderActive
-	} else {
-		listStyle = Theme.BorderActive
-	}
-
-	listBox := listStyle.Width(listW).Height(contentH).Render(m.renderList(listW, contentH))
-	detailBox := detailStyle.Width(detailW).Height(contentH).Render(m.viewport.View())
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, listBox, detailBox)
+	body := Theme.BorderActive.
+		Width(innerW + 2).
+		Height(innerH).
+		Padding(0, 1).
+		Render(m.renderList(innerW, innerH))
 
 	v := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 
@@ -737,35 +720,73 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderFooter() string {
-	hint := "j/k move  l detail  o attach  f follow-up  s spawn  / filter  : cmd  ? help  q quit"
+	hint := "j/k move  o attach  f follow-up  s spawn  / filter  : cmd  ? help  q quit"
 	return Theme.Footer.Padding(0, 1).Render(hint)
 }
 
+// renderList groups sessions by status under colored section headers, then
+// fits the result to the available height. Each session is one line:
+// "<dot> <cwd>     <preview…>      <age>".
 func (m Model) renderList(w, h int) string {
 	if len(m.sessions) == 0 {
 		return Theme.Hint.Render("no sessions yet — start `claude` or press s to spawn one")
 	}
-	innerW := w - 4
-	if innerW < 10 {
-		innerW = 10
+
+	// Group sessions by status. m.sessions is already sorted by tier+recency,
+	// so a single pass keeps tier order stable.
+	groups := []struct {
+		status claude.Status
+		title  string
+		items  []claude.Session
+	}{
+		{claude.StatusNeedsInput, "Needs input", nil},
+		{claude.StatusBusy, "Working", nil},
+		{claude.StatusIdle, "Idle", nil},
+		{claude.StatusStopped, "Stopped", nil},
 	}
-	rows := make([]string, 0, h)
 	for _, s := range m.sessions {
-		rows = append(rows, m.renderRow(s, innerW))
+		for i := range groups {
+			if groups[i].status == s.Status {
+				groups[i].items = append(groups[i].items, s)
+				break
+			}
+		}
 	}
-	if len(rows) > h {
-		rows = rows[:h]
+
+	var lines []string
+	first := true
+	for _, g := range groups {
+		if len(g.items) == 0 {
+			continue
+		}
+		if !first {
+			lines = append(lines, "")
+		}
+		first = false
+		_, gs := StatusGlyph(g.status.String())
+		header := gs.Bold(true).Render(g.title) +
+			Theme.Hint.Render(fmt.Sprintf("  %d", len(g.items)))
+		lines = append(lines, header)
+		for _, s := range g.items {
+			lines = append(lines, m.renderRow(s, w))
+		}
 	}
-	return strings.Join(rows, "\n")
+
+	// Crop to available height.
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	return strings.Join(lines, "\n")
 }
 
+// renderRow is one session line, padded to width w so the selection
+// background paints the full row.
 func (m Model) renderRow(s claude.Session, w int) string {
 	statusStr := s.Status.String()
 	glyph, gStyle := StatusGlyph(statusStr)
 	dot := gStyle.Render(glyph)
 	if s.Status == claude.StatusBusy {
-		dot = m.spinner.View()
-		dot = gStyle.Render(dot)
+		dot = gStyle.Render(m.spinner.View())
 	}
 
 	cwd := filepath.Base(s.CWD)
@@ -775,63 +796,50 @@ func (m Model) renderRow(s claude.Session, w int) string {
 	age := relTime(s.UpdatedAt)
 
 	preview := s.Preview
-	if cached, ok := m.transcript[s.ID]; ok && len(cached) > 0 {
-		preview = claude.Preview(cached)
+	if p, ok := m.previews[s.ID]; ok && p != "" {
+		preview = p
 	}
 
-	main := fmt.Sprintf("%s %s", dot, cwd)
-	tail := Theme.Hint.Render(age)
-	gap := w - lipgloss.Width(main) - lipgloss.Width(tail)
-	if gap < 1 {
-		gap = 1
-	}
-	line := main + strings.Repeat(" ", gap) + tail
+	// Layout: "  <dot> <cwd>   <preview>          <age>"
+	left := "  " + dot + " " + cwd
+	leftW := lipgloss.Width(left)
 
-	if preview != "" {
-		previewLine := "  " + Theme.Hint.Render(truncate(preview, w-2))
-		line = line + "\n" + previewLine
+	// Reserve right side for age (padded to a fixed slot for alignment).
+	const ageSlot = 5
+	ageStr := age
+	if lipgloss.Width(ageStr) > ageSlot {
+		ageStr = ageStr[:ageSlot]
 	}
+	rightPad := strings.Repeat(" ", ageSlot-lipgloss.Width(ageStr))
+	rightRendered := rightPad + Theme.Hint.Render(ageStr)
+	rightW := ageSlot
+
+	mid := w - leftW - rightW - 2
+	if mid < 0 {
+		mid = 0
+	}
+	previewRendered := ""
+	if mid > 4 && preview != "" {
+		previewRendered = "  " + Theme.Hint.Render(truncate(preview, mid-2))
+	}
+	pad := w - leftW - lipgloss.Width(previewRendered) - rightW
+	if pad < 1 {
+		pad = 1
+	}
+	line := left + previewRendered + strings.Repeat(" ", pad) + rightRendered
 
 	if s.ID == m.selected {
 		return Theme.RowSelected.Width(w).Render(line)
 	}
-	// fade-in: dim newly-arrived rows for the first ~400ms
 	if first, ok := m.firstSeen[s.ID]; ok {
-		if elapsed := time.Since(first); elapsed < 400*time.Millisecond {
+		if time.Since(first) < 400*time.Millisecond {
 			return lipgloss.NewStyle().
 				Foreground(lipgloss.Color("242")).
 				Width(w).
 				Render(line)
 		}
 	}
-	return Theme.RowDim.Width(w).Render(line)
-}
-
-func (m Model) renderTranscript(events []claude.TranscriptEvent) string {
-	if len(events) == 0 {
-		return Theme.Hint.Render("no transcript")
-	}
-	var b strings.Builder
-	for _, e := range events {
-		switch e.Type {
-		case "user":
-			b.WriteString(Theme.Title.Render("you ▸ "))
-			b.WriteString(strings.TrimSpace(e.Text))
-			b.WriteString("\n\n")
-		case "assistant":
-			b.WriteString(Theme.StatusIdle.Render("claude ▸ "))
-			b.WriteString(strings.TrimSpace(e.Text))
-			b.WriteString("\n\n")
-		case "tool_use":
-			b.WriteString(Theme.Hint.Render("⌁ " + e.ToolName + "\n"))
-		case "tool_result":
-			line := truncate(strings.TrimSpace(e.Text), 200)
-			if line != "" {
-				b.WriteString(Theme.Hint.Render("  " + line + "\n"))
-			}
-		}
-	}
-	return b.String()
+	return lipgloss.NewStyle().Width(w).Render(line)
 }
 
 func (m Model) overlayModal(base string) string {
@@ -863,7 +871,6 @@ func (m Model) overlayModal(base string) string {
 func (m Model) renderHelp() string {
 	rows := [][2]string{
 		{"j / k", "move down / up"},
-		{"h / l", "focus list / detail"},
 		{"gg / G", "top / bottom"},
 		{"^u / ^d", "page up / down"},
 		{"/", "filter"},
